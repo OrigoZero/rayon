@@ -78,7 +78,7 @@ pub(super) struct CoreLatch {
 
 impl CoreLatch {
     #[inline]
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             state: AtomicUsize::new(0),
         }

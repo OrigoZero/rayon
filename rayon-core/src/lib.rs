@@ -199,6 +199,10 @@ pub struct ThreadPoolBuilder<S = DefaultSpawn> {
     /// "depth-first" fashion. If true, they will do a "breadth-first"
     /// fashion. Depth-first is the default.
     breadth_first: bool,
+
+    /// The rounds an idle worker looks for work before it starts to fall
+    /// asleep. `None` keeps the default.
+    idle_rounds: Option<u32>,
 }
 
 /// Contains the rayon thread pool configuration. Use [`ThreadPoolBuilder`] instead.
@@ -235,6 +239,7 @@ impl Default for ThreadPoolBuilder {
             exit_handler: None,
             spawn_handler: DefaultSpawn,
             breadth_first: false,
+            idle_rounds: None,
         }
     }
 }
@@ -445,6 +450,7 @@ impl<S> ThreadPoolBuilder<S> {
             start_handler: self.start_handler,
             exit_handler: self.exit_handler,
             breadth_first: self.breadth_first,
+            idle_rounds: self.idle_rounds,
         }
     }
 
@@ -624,6 +630,32 @@ impl<S> ThreadPoolBuilder<S> {
         self.breadth_first
     }
 
+    /// Sets how many rounds a worker that runs out of work keeps looking
+    /// for more before it starts to fall asleep.
+    ///
+    /// Each round looks once through the worker's own queue, the queues of
+    /// the other workers and the pool's injected jobs, and yields the CPU
+    /// when it finds nothing. After `rounds` such rounds the worker
+    /// announces that it is about to sleep, looks one round more, and then
+    /// sleeps until new work wakes it, using no CPU while it sleeps.
+    ///
+    /// The default is 32 rounds, which keeps a worker near at hand for work
+    /// that arrives in quick succession. A pool that is handed work in
+    /// bursts with long gaps between them (once per frame, say) spends
+    /// those rounds on every gap; fewer rounds put its workers to sleep
+    /// sooner, at the cost of waking them when the next burst arrives.
+    /// With `0` a worker that finds nothing sleeps after its one
+    /// announcing round.
+    pub fn idle_rounds(mut self, rounds: u32) -> Self {
+        self.idle_rounds = Some(rounds);
+        self
+    }
+
+    fn get_idle_rounds(&self) -> u32 {
+        self.idle_rounds
+            .unwrap_or(crate::sleep::DEFAULT_ROUNDS_UNTIL_SLEEPY)
+    }
+
     /// Takes the current thread start callback, leaving `None`.
     fn take_start_handler(&mut self) -> Option<Box<StartHandler>> {
         self.start_handler.take()
@@ -800,6 +832,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             ref exit_handler,
             spawn_handler: _,
             ref breadth_first,
+            ref idle_rounds,
         } = *self;
 
         // Just print `Some(<closure>)` or `None` to the debug
@@ -824,6 +857,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             .field("start_handler", &start_handler)
             .field("exit_handler", &exit_handler)
             .field("breadth_first", &breadth_first)
+            .field("idle_rounds", &idle_rounds)
             .finish()
     }
 }
