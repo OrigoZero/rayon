@@ -24,6 +24,10 @@ pub(super) struct Sleep {
     worker_sleep_states: Vec<CachePadded<WorkerSleepState>>,
 
     counters: AtomicCounters,
+
+    /// How many rounds an idle worker looks for work, yielding between
+    /// them, before it announces that it is about to sleep.
+    rounds_until_sleepy: u32,
 }
 
 /// An instance of this struct is created when a thread becomes idle.
@@ -37,6 +41,10 @@ pub(super) struct IdleState {
 
     /// How many rounds have we been circling without sleeping?
     rounds: u32,
+
+    /// The round at which this worker announces that it is about to sleep:
+    /// the pool's `rounds_until_sleepy`. It sleeps the round after.
+    rounds_until_sleepy: u32,
 
     /// Once we become sleepy, what was the sleepy counter value?
     /// Set to `INVALID_SLEEPY_COUNTER` otherwise.
@@ -53,15 +61,18 @@ struct WorkerSleepState {
     condvar: Condvar,
 }
 
-const ROUNDS_UNTIL_SLEEPY: u32 = 32;
-const ROUNDS_UNTIL_SLEEPING: u32 = ROUNDS_UNTIL_SLEEPY + 1;
+/// The rounds an idle worker looks for work before it announces that it is
+/// about to sleep, unless its pool was built with
+/// [`ThreadPoolBuilder::idle_rounds`](crate::ThreadPoolBuilder::idle_rounds).
+pub(crate) const DEFAULT_ROUNDS_UNTIL_SLEEPY: u32 = 32;
 
 impl Sleep {
-    pub(super) fn new(n_threads: usize) -> Sleep {
+    pub(super) fn new(n_threads: usize, rounds_until_sleepy: u32) -> Sleep {
         assert!(n_threads <= THREADS_MAX);
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| Default::default()).collect(),
             counters: AtomicCounters::new(),
+            rounds_until_sleepy,
         }
     }
 
@@ -72,6 +83,7 @@ impl Sleep {
         IdleState {
             worker_index,
             rounds: 0,
+            rounds_until_sleepy: self.rounds_until_sleepy,
             jobs_counter: JobsEventCounter::DUMMY,
         }
     }
@@ -91,18 +103,20 @@ impl Sleep {
         latch: &CoreLatch,
         has_injected_jobs: impl FnOnce() -> bool,
     ) {
-        if idle_state.rounds < ROUNDS_UNTIL_SLEEPY {
+        let rounds_until_sleepy = idle_state.rounds_until_sleepy;
+        let rounds_until_sleeping = rounds_until_sleepy + 1;
+        if idle_state.rounds < rounds_until_sleepy {
             thread::yield_now();
             idle_state.rounds += 1;
-        } else if idle_state.rounds == ROUNDS_UNTIL_SLEEPY {
+        } else if idle_state.rounds == rounds_until_sleepy {
             idle_state.jobs_counter = self.announce_sleepy();
             idle_state.rounds += 1;
             thread::yield_now();
-        } else if idle_state.rounds < ROUNDS_UNTIL_SLEEPING {
+        } else if idle_state.rounds < rounds_until_sleeping {
             idle_state.rounds += 1;
             thread::yield_now();
         } else {
-            debug_assert_eq!(idle_state.rounds, ROUNDS_UNTIL_SLEEPING);
+            debug_assert_eq!(idle_state.rounds, rounds_until_sleeping);
             self.sleep(idle_state, latch, has_injected_jobs);
         }
     }
@@ -318,7 +332,33 @@ impl IdleState {
     }
 
     fn wake_partly(&mut self) {
-        self.rounds = ROUNDS_UNTIL_SLEEPY;
+        self.rounds = self.rounds_until_sleepy;
         self.jobs_counter = JobsEventCounter::DUMMY;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rounds a worker of a pool built with `rounds_until_sleepy` looks for
+    /// work, finding none, before it has announced that it is about to sleep.
+    fn rounds_until_announced(rounds_until_sleepy: u32) -> u32 {
+        let sleep = Sleep::new(1, rounds_until_sleepy);
+        let latch = CoreLatch::new();
+        let mut idle_state = sleep.start_looking(0);
+        let mut rounds = 0;
+        while !idle_state.jobs_counter.is_sleepy() {
+            sleep.no_work_found(&mut idle_state, &latch, || false);
+            rounds += 1;
+        }
+        rounds
+    }
+
+    #[test]
+    fn a_worker_announces_it_will_sleep_after_the_idle_rounds_its_pool_sets() {
+        assert_eq!(rounds_until_announced(DEFAULT_ROUNDS_UNTIL_SLEEPY), 33);
+        assert_eq!(rounds_until_announced(4), 5);
+        assert_eq!(rounds_until_announced(0), 1);
     }
 }
